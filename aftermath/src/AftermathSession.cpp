@@ -68,25 +68,246 @@ extern "C" {
 	#include <aftermath/core/function_symbol_array.h>
 	#include <aftermath/core/stack_frame_array.h>
 	#include <aftermath/core/stack_frame_period_array.h>
+	#include <aftermath/core/counter_event_array.h>
+}
+
+// TODO move this stuff to counter_event header
+
+int64_t interpolate_value(am_counter_event* left, am_counter_event* right, uint64_t time){
+
+	if(left->value == right->value || left->time == time)
+		return left->value;
+
+	if(right->time == time)
+		return right->value;
+
+	double delta = ((double) right->value) - ((double) left->value);
+	double slope = delta / ((double)(right->time - left->time));
+	double val = ((double) left->value) + slope*((double) time - left->time);
+
+	return (int64_t) val;
+
+}
+
+int64_t extrapolate_value(am_counter_event* left, am_counter_event* right, uint64_t time){
+	
+	if(left->value == right->value || left->time == time)
+		return left->value;
+
+	if(right->time == time)
+		return right->value;
+
+	double delta = ((double) right->value) - ((double) left->value);
+	double slope = delta / ((double)(right->time - left->time));
+
+	double val = -1.0;
+
+	if(time < left->time) {
+
+		val = ((double) left->value) - slope*((double) left->time - time);
+		if(val < 0)
+			val = 0.0;
+
+	} else if(time > right->time) {
+
+		val = ((double) right->value) + slope*((double) time - right->time);
+
+	}
+
+	return (int64_t) val;
+}
+
+std::vector<uint64_t> get_counter_event_values(
+		uint64_t start_time,
+		uint64_t end_time,
+		std::vector<am_counter_event_array*> event_arrays,
+		unsigned& start_event_pos,
+		unsigned& end_event_pos){
+
+	std::vector<uint64_t> values;
+
+	// -2 meaning we have not yet checked, -1 meaning we have checked and there is no value
+	int first_before_start_idx = -2;
+	int first_after_end_idx = -2;
+
+	// for each counter event
+	for(unsigned k = 0; k < event_arrays.size(); k++)
+	{
+		am_counter_event_array* event_array = event_arrays.at(k);
+		am_counter_event* events = (am_counter_event*) event_array->elements;
+
+		if(event_array->num_elements < 2){
+			std::cerr << "Cannot interpolate counter values with only " << event_array->num_elements << " counts recorded." << std::endl;
+			exit(1);
+			//values.push_back(0);
+			//continue;
+		}
+
+		if((first_before_start_idx == -2) || (first_after_end_idx == -2)){
+
+			// We haven't yet checked for the positions, so do so
+			first_before_start_idx = -1;
+			first_after_end_idx = -1;
+
+			for(unsigned l = start_event_pos; l < event_array->num_elements; l++){
+				if(events[l].time > start_time){
+					first_before_start_idx = l-1;
+					if(l>0)
+						start_event_pos = first_before_start_idx;
+					break;
+				}
+			}
+			
+			for(unsigned l = end_event_pos; l < event_array->num_elements; l++){
+				if(events[l].time >= end_time){
+					first_after_end_idx = l;
+					end_event_pos = first_after_end_idx;
+					break;
+				}
+			}
+
+		}
+
+		int64_t start_value = -1;
+		int64_t end_value = -1;
+
+		if(first_before_start_idx == -1){
+
+			// there was no counter value read before the start time, so extrapolate backwards from the next two
+			am_counter_event* left_event = &events[0];
+			am_counter_event* right_event = &events[1];
+
+			start_value = extrapolate_value(left_event, right_event, start_time);
+
+		} else {
+
+			am_counter_event* left_event = &events[first_before_start_idx];
+
+			if((unsigned)(first_before_start_idx+1) == event_array->num_elements){
+
+				// There is only a value before, so we need to extrapolate forwards from the final two values
+				// This also means the end_value will need to be entirely extrapolated
+
+				left_event = &events[first_before_start_idx-1];
+				am_counter_event* right_event = &events[first_before_start_idx];
+
+				start_value = extrapolate_value(left_event, right_event, start_time);
+
+			} else {
+
+				// There is a value before and after the start_time, so interpolate the value
+				am_counter_event* right_event = &events[first_before_start_idx+1];
+
+				start_value = interpolate_value(left_event, right_event, start_time);
+
+			}
+
+		}
+
+		if(first_after_end_idx == -1){
+
+			// there was no counter value read after the end time, so extrapolate forwards from the last two
+
+			am_counter_event* left_event = &events[event_array->num_elements-2];
+			am_counter_event* right_event = &events[event_array->num_elements-1];
+
+			end_value = extrapolate_value(left_event, right_event, end_time);
+
+		} else {
+			
+			// it is guaranteed that first_after_end_idx > 0, so I don't need to bounds check left
+			am_counter_event* left_event = &events[first_after_end_idx-1];
+			am_counter_event* right_event = &events[first_after_end_idx];
+
+			end_value = interpolate_value(left_event, right_event, end_time);
+
+		}
+
+		uint64_t count = 0;
+		if(end_value > start_value)
+			count = (uint64_t) (end_value - start_value);
+		
+		values.push_back(count);
+		
+	}
+
+	return values;
+
 }
 
 /* Dump the call graph as a flat file that I can parse easily later */
 void dumpCallGraph(am_trace* trace)
 {
 
+	// Output counter mappings
+  am_array_collection* global_ac = &trace->trace_arrays;
+
+	for(unsigned j = 0; j < global_ac->num_elements; j++)
+	{
+		am_array_collection_entry ace = global_ac->elements[j];
+
+		// counter descriptions
+		if(strcmp("am::core::counter_description", ace.type) == 0)
+		{
+			am_typed_array_generic* array = ace.array;
+
+			am_counter_description* descriptions =
+				(am_counter_description*) array->elements;
+
+			// Per each event
+			for(unsigned k = 0; k < array->num_elements; k++)
+			{
+				am_counter_description desc = descriptions[k];
+				std::cout << "counter_description," << k << "," << desc.name << std::endl;
+			}
+		}
+
+	}
+
   am_event_collection_array ecs = trace->event_collections;
 
-  // For each event collection
+  // For each event collection (i.e. per cpu)
   for(unsigned i = 0; i < ecs.num_elements; i++)
   {
 
     am_array_collection* ac = &ecs.elements[i].event_arrays;
+
+		std::vector<am_counter_event_array*> event_arrays;
+
+		// Find hardware event count arrays first
+    for(unsigned j = 0; j < ac->num_elements; j++)
+    {
+      am_array_collection_entry ace = ac->elements[j];
+			std::cout << "Collection type = " << ace.type << std::endl;
+
+			if(strcmp("am::core::counter_event", ace.type) == 0)
+			{
+        am_typed_array_generic* array = ace.array;
+        am_counter_event_array* arrays = (am_counter_event_array*) array->elements;
+
+				for(unsigned k = 0; k < array->num_elements; k++){
+					
+					am_counter_event_array* event_array = &arrays[k];
+					event_arrays.push_back(event_array);
+
+				}
+			}
+		}
 
     // For each event type
     for(unsigned j = 0; j < ac->num_elements; j++)
     {
       am_array_collection_entry ace = ac->elements[j];
 			std::cout << "Collection type = " << ace.type << std::endl;
+			
+			/* Assuming that all counters have event counts at the same timestamp, so
+			*  tracking one position per CPU is sufficient
+			*
+			*  Because the periods are contiguous and non-overlapping, the next start
+			*  is always >= current start and the next end is always >= current_end
+			*/
+			unsigned start_event_pos = 0;
+			unsigned end_event_pos = 0;
       
 			if(strcmp("am::core::stack_frame_period", ace.type) == 0)
       {
@@ -99,11 +320,31 @@ void dumpCallGraph(am_trace* trace)
         {
 					am_stack_frame_period* period = &events[k];
 
+					if(period->stack_frame->interval.start == 167074116 && period->stack_frame->interval.end == 7351438002)
+						std::cout << "Processing a period of the target frame!" << std::endl;
+
+					std::vector<uint64_t> values = get_counter_event_values(
+						period->interval.start,
+						period->interval.end,
+						event_arrays,
+						start_event_pos,
+						end_event_pos
+					);
+
 					std::cout << "period," << i << ",";
 					std::cout << period->interval.start << "," << period->interval.end << ",";
 					std::cout << period->stack_frame << "," << period->stack_frame->parent_frame << ",";
 					std::cout << period->stack_frame->interval.start << "," << period->stack_frame->interval.end << ",";
-					std::cout << period->stack_frame->depth << "," << period->stack_frame->function_symbol->name << std::endl;
+					std::cout << period->stack_frame->depth << ",";
+						
+					for(unsigned l = 0; l < values.size(); l++){
+						std::cout << values.at(l) << ",";
+					}
+
+					std::cout << period->stack_frame->function_symbol->name << std::endl;
+					
+					if(period->stack_frame->interval.start == 167074116 && period->stack_frame->interval.end == 7351438002)
+						std::cout << "Finished processing a period of the target frame!" << std::endl;
 
 				}
 
@@ -205,13 +446,31 @@ void dumpCallGraph(am_trace* trace)
 
         am_openmp_work* events = (am_openmp_work*) array->elements;
 
+				// Work callbacks cannot be gauranteed contiguous
+				unsigned temp_start_event_pos = 0;
+				unsigned temp_end_event_pos = 0;
+
         for(unsigned k = 0; k < array->num_elements; k++)
         {
 					am_openmp_work* event = &events[k];
 
 					std::cout << "work," << i << ",";
 					std::cout << event->interval.start << "," << event->interval.end;
-					std::cout << "," << event->type << "," << event->count << std::endl;
+					std::cout << "," << event->type << "," << event->count;
+
+					std::vector<uint64_t> values = get_counter_event_values(
+						event->interval.start,
+						event->interval.end,
+						event_arrays,
+						temp_start_event_pos,
+						temp_end_event_pos
+					);
+
+					for(unsigned l = 0; l < values.size(); l++){
+						std::cout << "," << values.at(l);
+					}
+
+					std::cout << std::endl;
 
 				}
 
@@ -257,6 +516,17 @@ void dumpCallGraph(am_trace* trace)
 		}
 
 	}
+  
+	am_array_collection* ac = &trace->trace_arrays;
+
+	// For each event type
+	for(unsigned j = 0; j < ac->num_elements; j++)
+	{
+		am_array_collection_entry ace = ac->elements[j];
+		std::cout << "Trace collection type = " << ace.type << std::endl;
+	}
+
+	exit(0);
 
 }
 
